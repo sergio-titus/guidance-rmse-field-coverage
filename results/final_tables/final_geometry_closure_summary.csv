@@ -1,0 +1,5 @@
+Metric,Number_of_Pairs,Median_Absolute_Error,Maximum_Absolute_Error
+Skip fraction,378,1.1032841307212493e-15,4.704570066849101e-15
+Overlap fraction,378,1.5005358067199381e-15,6.300515664747763e-15
+Outside-application fraction,378,1.3981871216373065e-15,5.398459457239824e-15
+Total coverage-count discrepancy,378,2.3037127760972e-15,9.492406860545088e-15

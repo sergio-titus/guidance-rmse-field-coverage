@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this code or analysis framework, please cite the associated manuscript and the original GNSS dataset."
+title: "Beyond Guidance RMSE for Field Coverage Risk in Precision Agriculture"
+type: software
+authors:
+  - family-names: "Aglin"
+    given-names: "Koffi Titus Sergio"
+repository-code: ""
+license: ""

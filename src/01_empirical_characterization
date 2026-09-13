@@ -1,0 +1,865 @@
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.io import loadmat
+from scipy.signal import welch
+
+
+# ============================================================
+# STAGE 0B — EMPIRICAL CHARACTERIZATION OF GUIDANCE ERRORS
+# ============================================================
+# Purpose:
+#   Characterize the observed guidance trajectories directly
+#   from the published GNSS tractor-guidance dataset.
+#
+# Principles:
+#   - No stochastic model is imposed here.
+#   - No AR(1) coefficient is assumed.
+#   - No handcrafted positioning-error levels are introduced.
+#   - Each pass is kept separate for temporal/spatial analysis.
+#   - Northing is treated as signed lateral deviation from the
+#     relative reference, consistent with the authors' scripts.
+#
+# Outputs:
+#   1. Per-pass descriptive statistics
+#   2. Configuration-level short-term statistics using Pass 1+3
+#      to reproduce the original Table 2 logic
+#   3. Spatial ACF curves for every pass
+#   4. PSD curves for every pass
+#   5. Diagnostic figures
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. Project paths
+# ------------------------------------------------------------
+
+PROJECT_DIR = Path(r"C:\Users\User\GNSS_Coverage_Project")
+
+MAT_FILE = (
+    PROJECT_DIR
+    / "Dataset for Performance assestment of no-fee GNSS"
+    / "2_Guidance_tests"
+    / "2A_Guidance_tests_data.mat"
+)
+
+RESULTS_DIR = PROJECT_DIR / "results"
+TABLES_DIR = RESULTS_DIR / "tables"
+FIGURES_DIR = RESULTS_DIR / "figures"
+ACF_DIR = FIGURES_DIR / "acf"
+PSD_DIR = FIGURES_DIR / "psd"
+TRAJECTORY_DIR = FIGURES_DIR / "trajectories"
+
+for directory in [
+    RESULTS_DIR,
+    TABLES_DIR,
+    FIGURES_DIR,
+    ACF_DIR,
+    PSD_DIR,
+    TRAJECTORY_DIR,
+]:
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+# ------------------------------------------------------------
+# 2. Scientific analysis settings
+# ------------------------------------------------------------
+
+# The authors' plotting scripts display the useful straight-line
+# evaluation interval from 25 m to 300 m.
+X_MIN = 25.0
+X_MAX = 300.0
+
+# Sampling rate reported in the paper.
+FS_HZ = 5.0
+
+# Tractor speed reported in the paper.
+TRACTOR_SPEED_MPS = 1.0
+
+# Nominal spatial sampling interval implied by 1 m/s at 5 Hz.
+NOMINAL_DX = TRACTOR_SPEED_MPS / FS_HZ
+
+# Maximum ACF distance for plotting/reporting.
+# This is not a stochastic-model parameter; it only limits the
+# descriptive lag window shown in the output.
+MAX_ACF_DISTANCE_M = 100.0
+
+
+# ------------------------------------------------------------
+# 3. Load MATLAB file
+# ------------------------------------------------------------
+
+if not MAT_FILE.exists():
+    raise FileNotFoundError(f"MAT file not found:\n{MAT_FILE}")
+
+print("=" * 80)
+print("STAGE 0B — EMPIRICAL GUIDANCE ERROR CHARACTERIZATION")
+print("=" * 80)
+
+print(f"\nLoading:\n{MAT_FILE}")
+
+raw = loadmat(
+    MAT_FILE,
+    squeeze_me=True,
+    struct_as_record=False
+)
+
+data = {
+    k: v
+    for k, v in raw.items()
+    if not k.startswith("__")
+}
+
+print(f"\nLoaded {len(data)} MATLAB variables.")
+
+
+# ------------------------------------------------------------
+# 4. Parse all Easting/Northing variables
+# ------------------------------------------------------------
+
+pattern = re.compile(
+    r"Guidance_Conf_(C\d{2})_(.+)_Pass_(\d)_(Easting|Northing)$"
+)
+
+records = {}
+
+for variable_name, values in data.items():
+
+    match = pattern.match(variable_name)
+
+    if not match:
+        continue
+
+    config_code = match.group(1)
+    config_name = match.group(2)
+    pass_number = int(match.group(3))
+    coordinate = match.group(4)
+
+    key = (config_code, config_name, pass_number)
+
+    if key not in records:
+        records[key] = {}
+
+    records[key][coordinate] = np.asarray(values, dtype=float).ravel()
+
+
+# ------------------------------------------------------------
+# 5. Validate dataset structure
+# ------------------------------------------------------------
+
+expected_passes = 14 * 3
+
+if len(records) != expected_passes:
+    raise RuntimeError(
+        f"Expected {expected_passes} configuration-pass records, "
+        f"but found {len(records)}."
+    )
+
+for key, coords in records.items():
+
+    if "Easting" not in coords or "Northing" not in coords:
+        raise RuntimeError(
+            f"Missing coordinate array for {key}"
+        )
+
+    if len(coords["Easting"]) != len(coords["Northing"]):
+        raise RuntimeError(
+            f"Easting/Northing length mismatch for {key}"
+        )
+
+print(f"Validated {len(records)} configuration-pass records.")
+print("Each pass contains paired Easting and Northing arrays.")
+
+
+# ------------------------------------------------------------
+# 6. Helper functions
+# ------------------------------------------------------------
+
+def rms(x):
+    x = np.asarray(x, dtype=float)
+    return np.sqrt(np.mean(x ** 2))
+
+
+def safe_skewness(x):
+    x = np.asarray(x, dtype=float)
+
+    std = np.std(x, ddof=1)
+
+    if std == 0 or len(x) < 3:
+        return np.nan
+
+    z = (x - np.mean(x)) / std
+    return np.mean(z ** 3)
+
+
+def safe_kurtosis_excess(x):
+    x = np.asarray(x, dtype=float)
+
+    std = np.std(x, ddof=1)
+
+    if std == 0 or len(x) < 4:
+        return np.nan
+
+    z = (x - np.mean(x)) / std
+    return np.mean(z ** 4) - 3.0
+
+
+def lag1_autocorrelation(x):
+    x = np.asarray(x, dtype=float)
+
+    if len(x) < 2:
+        return np.nan
+
+    x0 = x[:-1]
+    x1 = x[1:]
+
+    if np.std(x0) == 0 or np.std(x1) == 0:
+        return np.nan
+
+    return np.corrcoef(x0, x1)[0, 1]
+
+
+def empirical_acf(x, max_lag):
+    """
+    FFT-based normalized autocorrelation.
+    Returns ACF from lag 0 through max_lag.
+    """
+
+    x = np.asarray(x, dtype=float)
+    x = x - np.mean(x)
+
+    n = len(x)
+
+    if n == 0:
+        return np.array([])
+
+    fft_len = 1 << (2 * n - 1).bit_length()
+
+    f = np.fft.rfft(x, n=fft_len)
+    acov = np.fft.irfft(f * np.conjugate(f), n=fft_len)[:n]
+
+    normalization = np.arange(n, 0, -1)
+    acov = acov / normalization
+
+    if acov[0] == 0:
+        return np.full(max_lag + 1, np.nan)
+
+    acf = acov / acov[0]
+
+    return acf[:max_lag + 1]
+
+
+def estimate_e_folding_distance(acf_values, dx):
+    """
+    Empirical correlation distance defined as the first lag at which
+    ACF <= exp(-1). No exponential model is fitted here.
+    """
+
+    if len(acf_values) < 2:
+        return np.nan
+
+    threshold = np.exp(-1)
+
+    candidates = np.where(acf_values[1:] <= threshold)[0]
+
+    if len(candidates) == 0:
+        return np.nan
+
+    lag_index = candidates[0] + 1
+
+    return lag_index * dx
+
+
+def first_zero_crossing_distance(acf_values, dx):
+
+    if len(acf_values) < 2:
+        return np.nan
+
+    candidates = np.where(acf_values[1:] <= 0)[0]
+
+    if len(candidates) == 0:
+        return np.nan
+
+    lag_index = candidates[0] + 1
+
+    return lag_index * dx
+
+
+# ------------------------------------------------------------
+# 7. Process every pass independently
+# ------------------------------------------------------------
+
+pass_stats_rows = []
+acf_rows = []
+psd_rows = []
+
+processed_passes = {}
+
+for key in sorted(records.keys()):
+
+    config_code, config_name, pass_number = key
+
+    east = records[key]["Easting"]
+    north = records[key]["Northing"]
+
+    # --------------------------------------------------------
+    # Restrict to the 25–300 m interval used in authors' plots
+    # --------------------------------------------------------
+
+    mask = (
+        np.isfinite(east)
+        & np.isfinite(north)
+        & (east >= X_MIN)
+        & (east <= X_MAX)
+    )
+
+    x = east[mask]
+    e = north[mask]
+
+    if len(x) < 10:
+        raise RuntimeError(
+            f"Too few valid observations after filtering for {key}"
+        )
+
+    # Sort by Easting so spatial lag is monotonic.
+    order = np.argsort(x)
+
+    x = x[order]
+    e = e[order]
+
+    # Store processed pass
+    processed_passes[key] = {
+        "Easting": x,
+        "Error": e
+    }
+
+    # --------------------------------------------------------
+    # Empirical spatial sampling
+    # --------------------------------------------------------
+
+    dx_values = np.diff(x)
+    positive_dx = dx_values[dx_values > 0]
+
+    median_dx = (
+        np.median(positive_dx)
+        if len(positive_dx) > 0
+        else NOMINAL_DX
+    )
+
+    # --------------------------------------------------------
+    # Descriptive statistics
+    # --------------------------------------------------------
+
+    mean_signed = np.mean(e)
+    median_signed = np.median(e)
+    sd_signed = np.std(e, ddof=1)
+
+    mae = np.mean(np.abs(e))
+    rmse = rms(e)
+
+    abs_error = np.abs(e)
+
+    p50 = np.percentile(abs_error, 50)
+    p90 = np.percentile(abs_error, 90)
+    p95 = np.percentile(abs_error, 95)
+    p99 = np.percentile(abs_error, 99)
+
+    minimum = np.min(e)
+    maximum = np.max(e)
+
+    skew = safe_skewness(e)
+    kurt_excess = safe_kurtosis_excess(e)
+
+    rho1 = lag1_autocorrelation(e)
+
+    # --------------------------------------------------------
+    # Spatial ACF
+    # --------------------------------------------------------
+
+    max_lag_samples = int(
+        min(
+            len(e) - 1,
+            np.floor(MAX_ACF_DISTANCE_M / median_dx)
+        )
+    )
+
+    acf_values = empirical_acf(
+        e,
+        max_lag=max_lag_samples
+    )
+
+    acf_distance = (
+        np.arange(len(acf_values)) * median_dx
+    )
+
+    e_folding_distance = estimate_e_folding_distance(
+        acf_values,
+        median_dx
+    )
+
+    zero_crossing_distance = first_zero_crossing_distance(
+        acf_values,
+        median_dx
+    )
+
+    for distance_m, acf_value in zip(
+        acf_distance,
+        acf_values
+    ):
+        acf_rows.append({
+            "Configuration": config_code,
+            "Configuration_Name": config_name,
+            "Pass": pass_number,
+            "Lag_Distance_m": distance_m,
+            "ACF": acf_value
+        })
+
+    # --------------------------------------------------------
+    # PSD using Welch's method
+    # --------------------------------------------------------
+
+    # Spatial sampling frequency in samples per metre.
+    spatial_fs = 1.0 / median_dx
+
+    nperseg = min(1024, len(e))
+
+    frequencies, power = welch(
+        e - np.mean(e),
+        fs=spatial_fs,
+        nperseg=nperseg,
+        detrend="constant"
+    )
+
+    for freq, pwr in zip(frequencies, power):
+        psd_rows.append({
+            "Configuration": config_code,
+            "Configuration_Name": config_name,
+            "Pass": pass_number,
+            "Spatial_Frequency_cycles_per_m": freq,
+            "PSD": pwr
+        })
+
+    # --------------------------------------------------------
+    # Save descriptive row
+    # --------------------------------------------------------
+
+    pass_stats_rows.append({
+        "Configuration": config_code,
+        "Configuration_Name": config_name,
+        "Pass": pass_number,
+        "N": len(e),
+
+        "Easting_Min_m": np.min(x),
+        "Easting_Max_m": np.max(x),
+        "Median_Spatial_Step_m": median_dx,
+
+        "Signed_Mean_m": mean_signed,
+        "Signed_Median_m": median_signed,
+        "Signed_SD_m": sd_signed,
+
+        "MAE_m": mae,
+        "RMSE_m": rmse,
+
+        "Abs_P50_m": p50,
+        "Abs_P90_m": p90,
+        "Abs_P95_m": p95,
+        "Abs_P99_m": p99,
+
+        "Signed_Min_m": minimum,
+        "Signed_Max_m": maximum,
+
+        "Skewness": skew,
+        "Excess_Kurtosis": kurt_excess,
+
+        "Lag1_ACF": rho1,
+        "E_Folding_Distance_m": e_folding_distance,
+        "First_Zero_Crossing_m": zero_crossing_distance
+    })
+
+
+# ------------------------------------------------------------
+# 8. Convert output tables
+# ------------------------------------------------------------
+
+pass_stats = pd.DataFrame(pass_stats_rows)
+
+acf_table = pd.DataFrame(acf_rows)
+
+psd_table = pd.DataFrame(psd_rows)
+
+
+# ------------------------------------------------------------
+# 9. Reproduce authors' short-term Table 2 logic
+# ------------------------------------------------------------
+# Authors concatenate Pass 1 and Pass 3 Northing, take absolute
+# values, then compute RMS, mean and standard deviation.
+#
+# We also retain signed statistics for our later analysis.
+# ------------------------------------------------------------
+
+config_rows = []
+
+config_keys = sorted(
+    set(
+        (code, name)
+        for code, name, pass_num in processed_passes.keys()
+    )
+)
+
+for config_code, config_name in config_keys:
+
+    e1 = processed_passes[
+        (config_code, config_name, 1)
+    ]["Error"]
+
+    e3 = processed_passes[
+        (config_code, config_name, 3)
+    ]["Error"]
+
+    combined = np.concatenate([e1, e3])
+    combined_abs = np.abs(combined)
+
+    config_rows.append({
+        "Configuration": config_code,
+        "Configuration_Name": config_name,
+
+        "N_Pass1_Plus_Pass3": len(combined),
+
+        "Author_Style_RMS_m": rms(combined_abs),
+        "Author_Style_MeanAbs_m": np.mean(combined_abs),
+        "Author_Style_SDAbs_m": np.std(
+            combined_abs,
+            ddof=1
+        ),
+
+        "Signed_Mean_m": np.mean(combined),
+        "Signed_SD_m": np.std(combined, ddof=1),
+
+        "Abs_P95_m": np.percentile(
+            np.abs(combined),
+            95
+        ),
+
+        "Abs_P99_m": np.percentile(
+            np.abs(combined),
+            99
+        )
+    })
+
+config_stats = pd.DataFrame(config_rows)
+
+
+# ------------------------------------------------------------
+# 10. Save CSV tables
+# ------------------------------------------------------------
+
+pass_stats_file = (
+    TABLES_DIR
+    / "guidance_per_pass_empirical_statistics.csv"
+)
+
+config_stats_file = (
+    TABLES_DIR
+    / "guidance_configuration_short_term_statistics.csv"
+)
+
+acf_file = (
+    TABLES_DIR
+    / "guidance_spatial_acf.csv"
+)
+
+psd_file = (
+    TABLES_DIR
+    / "guidance_spatial_psd.csv"
+)
+
+pass_stats.to_csv(
+    pass_stats_file,
+    index=False
+)
+
+config_stats.to_csv(
+    config_stats_file,
+    index=False
+)
+
+acf_table.to_csv(
+    acf_file,
+    index=False
+)
+
+psd_table.to_csv(
+    psd_file,
+    index=False
+)
+
+
+# ------------------------------------------------------------
+# 11. Plot trajectories
+# ------------------------------------------------------------
+
+for config_code, config_name in config_keys:
+
+    plt.figure(figsize=(10, 5))
+
+    for pass_number in [1, 2, 3]:
+
+        key = (
+            config_code,
+            config_name,
+            pass_number
+        )
+
+        x = processed_passes[key]["Easting"]
+        e = processed_passes[key]["Error"]
+
+        plt.plot(
+            x,
+            e,
+            linewidth=1,
+            label=f"Pass {pass_number}"
+        )
+
+    plt.axhline(
+        0,
+        linestyle="--",
+        linewidth=1
+    )
+
+    plt.xlabel("Easting / along-track distance (m)")
+    plt.ylabel("Signed lateral deviation from reference (m)")
+    plt.title(
+        f"{config_code} — {config_name.replace('_', ' ')}"
+    )
+    plt.legend()
+    plt.tight_layout()
+
+    output_file = (
+        TRAJECTORY_DIR
+        / f"{config_code}_guidance_trajectories.png"
+    )
+
+    plt.savefig(
+        output_file,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+
+# ------------------------------------------------------------
+# 12. Plot spatial ACF
+# ------------------------------------------------------------
+
+for config_code, config_name in config_keys:
+
+    plt.figure(figsize=(10, 5))
+
+    subset = acf_table[
+        acf_table["Configuration"] == config_code
+    ]
+
+    for pass_number in [1, 2, 3]:
+
+        p = subset[
+            subset["Pass"] == pass_number
+        ]
+
+        plt.plot(
+            p["Lag_Distance_m"],
+            p["ACF"],
+            linewidth=1,
+            label=f"Pass {pass_number}"
+        )
+
+    plt.axhline(
+        np.exp(-1),
+        linestyle="--",
+        linewidth=1,
+        label="1/e"
+    )
+
+    plt.axhline(
+        0,
+        linestyle=":",
+        linewidth=1
+    )
+
+    plt.xlabel("Spatial lag (m)")
+    plt.ylabel("Autocorrelation")
+    plt.title(
+        f"{config_code} — Spatial ACF"
+    )
+    plt.legend()
+    plt.tight_layout()
+
+    output_file = (
+        ACF_DIR
+        / f"{config_code}_spatial_acf.png"
+    )
+
+    plt.savefig(
+        output_file,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+
+# ------------------------------------------------------------
+# 13. Plot PSD
+# ------------------------------------------------------------
+
+for config_code, config_name in config_keys:
+
+    plt.figure(figsize=(10, 5))
+
+    subset = psd_table[
+        psd_table["Configuration"] == config_code
+    ]
+
+    for pass_number in [1, 2, 3]:
+
+        p = subset[
+            subset["Pass"] == pass_number
+        ]
+
+        positive = (
+            p["Spatial_Frequency_cycles_per_m"] > 0
+        )
+
+        plt.loglog(
+            p.loc[
+                positive,
+                "Spatial_Frequency_cycles_per_m"
+            ],
+            p.loc[
+                positive,
+                "PSD"
+            ],
+            linewidth=1,
+            label=f"Pass {pass_number}"
+        )
+
+    plt.xlabel("Spatial frequency (cycles/m)")
+    plt.ylabel("Power spectral density")
+    plt.title(
+        f"{config_code} — Spatial PSD"
+    )
+    plt.legend()
+    plt.tight_layout()
+
+    output_file = (
+        PSD_DIR
+        / f"{config_code}_spatial_psd.png"
+    )
+
+    plt.savefig(
+        output_file,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+
+# ------------------------------------------------------------
+# 14. Global configuration comparison figure
+# ------------------------------------------------------------
+
+plt.figure(figsize=(12, 6))
+
+plt.plot(
+    config_stats["Configuration"],
+    config_stats["Author_Style_RMS_m"],
+    marker="o",
+    label="RMS"
+)
+
+plt.plot(
+    config_stats["Configuration"],
+    config_stats["Author_Style_MeanAbs_m"],
+    marker="o",
+    label="Mean absolute error"
+)
+
+plt.yscale("log")
+
+plt.xlabel("Configuration")
+plt.ylabel("Error (m, log scale)")
+plt.title(
+    "Short-term guidance error across GNSS configurations"
+)
+
+plt.legend()
+plt.tight_layout()
+
+comparison_file = (
+    FIGURES_DIR
+    / "configuration_guidance_error_comparison.png"
+)
+
+plt.savefig(
+    comparison_file,
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ------------------------------------------------------------
+# 15. Terminal summary
+# ------------------------------------------------------------
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 220)
+
+print("\n" + "=" * 80)
+print("CONFIGURATION-LEVEL SHORT-TERM STATISTICS")
+print("=" * 80)
+
+print(
+    config_stats[
+        [
+            "Configuration",
+            "Configuration_Name",
+            "Author_Style_RMS_m",
+            "Author_Style_MeanAbs_m",
+            "Author_Style_SDAbs_m",
+            "Signed_Mean_m",
+            "Abs_P95_m"
+        ]
+    ].to_string(index=False)
+)
+
+print("\n" + "=" * 80)
+print("OUTPUT FILES")
+print("=" * 80)
+
+print(f"\nPer-pass statistics:\n{pass_stats_file}")
+print(f"\nConfiguration statistics:\n{config_stats_file}")
+print(f"\nSpatial ACF data:\n{acf_file}")
+print(f"\nSpatial PSD data:\n{psd_file}")
+
+print(f"\nTrajectory figures:\n{TRAJECTORY_DIR}")
+print(f"\nACF figures:\n{ACF_DIR}")
+print(f"\nPSD figures:\n{PSD_DIR}")
+
+print("\n" + "=" * 80)
+print("STAGE 0B COMPLETE")
+print("=" * 80)
+
+print(
+    "\nNo stochastic error model has been assumed or fitted yet."
+)
+
+print(
+    "The next stage will compare the empirical distributions, "
+    "autocorrelation structures, and spectra to determine which "
+    "stochastic model families are actually supported by the data."
+)
